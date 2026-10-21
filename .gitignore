@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.env
+.venv/
+initial_demo_*.md
+incoming/
+processed/
+rejected/
+reports/
