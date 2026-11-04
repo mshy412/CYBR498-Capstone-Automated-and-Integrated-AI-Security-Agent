@@ -4,52 +4,67 @@
 **Course:** CYBR 498, Dr. Almalag
 **Platform:** Ubuntu 26.04 LTS, on-prem homelab (Proxmox)
 
-The AI security agent collects security information from Linux hosts and uses the Anthropic API to turn it into easy-to-read reports. A human reviews every report before it's emailed to managers. The goal is to save security analysts time and help non-technical stakeholders understand their risk.
+The AI security agent scans a Linux server, uses the Anthropic API to turn the results into easy-to-read reports, and emails them on a need-to-know basis. Security analysts get the full technical report, including the ClamAV malware scan. Everyone, including managers, gets a plain-English summary. A human approves the summary before it reaches managers. The goal is to save security analysts time and help non-technical stakeholders understand their risk.
 
 ## How it works
 
-1. `collect.sh` runs on each host (by cron) and gathers:
-   - pending updates
-   - failed logins and sudo usage since the last scan
+1. `week6_clamav_email/initial_scan_demo.py` collects:
+   - system info and pending updates
+   - failed SSH logins (last 24 hours, or 7 days on weekly runs)
    - failed services
-   - listening ports, network interfaces, and firewall rules
-   - a ClamAV malware scan (weekly only)
-2. Each host sends its results to the capstone VM's `incoming/` folder with `scp`.
-3. `agent.py` checks each file against the `endpoints` table, redacts usernames and MAC addresses, and sends it to Claude. It then saves one report per host and logs everything in MySQL.
-4. `approve.py` is the human-in-the-loop step. The reviewer reads each report, approves or rejects it, can choose to install security updates on approved hosts, and emails the approved reports to managers.
+   - listening ports and firewall status
+   - a ClamAV malware scan (initial and weekly only)
+2. Usernames and MAC addresses are redacted, and the data is sent to Claude Haiku through the Anthropic API.
+3. Claude returns two reports:
+   - **Technical report** for security analysts: findings, risk level, ClamAV results, and fix commands
+   - **Summary** for everyone: plain English, one line on the virus scan, no file paths, commands, or IPs
+4. Recipients come from MySQL: `security_analysts` gets both emails, and `managers_higher_ups` gets the summary only. Managers are optional. If none are listed, the summary goes to analysts only.
+5. Reports are saved to `reports/` (root-only) and emailed through Gmail over an encrypted connection.
 
-| Report  | When                        | ClamAV |
-|---------|-----------------------------|--------|
-| initial | once, by hand at deployment | no     |
-| nightly | every day, 2:00 AM          | no     |
-| weekly  | Sunday, 3:00 AM             | yes    |
+| Report  | When                          | ClamAV | Logs checked  |
+|---------|-------------------------------|--------|---------------|
+| initial | once, by hand at deployment   | yes    | last 24 hours |
+| nightly | every day, 2:00 AM            | no     | last 24 hours |
+| weekly  | Sunday, 3:00 AM               | yes    | last 7 days   |
+
+## Human in the loop
+
+- **Run by hand:** the script asks before sending each email.
+- **Run by cron:** the technical report goes to the security analysts, who are the reviewers. The summary is held as pending until an analyst approves it:
+  ```bash
+  sudo .venv/bin/python week6_clamav_email/initial_scan_demo.py send-summary
+  ```
+  Each pending summary can be sent (`y`), rejected (`n`), or skipped (`s`).
+
+Summaries move through `pending_summary` → `sent_summary` or `rejected_summary` in `reports/`.
 
 ## Project structure
 
 ```
 ai-security-agent/
-├── .env                     # api key and db credentials (not in git)
-├── .venv/                   # python virtual environment (not in git)
+├── .env                          # api key, db and gmail credentials (not in git)
+├── .venv/                        # python virtual environment (not in git)
+├── reports/                      # generated reports, root-only (not in git)
 ├── week2_database/
-│   ├── populate.sql         # creates the tables
-│   └── seed_data.sql        # adds the capstone vm as the first endpoint
-├── week3_api_scripts/
-│   ├── collect.sh           # runs on every host
-│   ├── agent.py             # sends scans to claude and saves reports
-│   ├── approve.py           # human review, updates, and email
-│   └── run.sh               # cron entry point on the capstone vm
-├── incoming/                # scans waiting to be processed
-├── processed/               # scans already turned into reports
-├── rejected/                # scans from hosts not in the endpoints table
-└── reports/                 # generated markdown reports
+│   ├── populate.sql              # creates the tables
+│   └── seed_data.sql             # adds the server as the first endpoint
+├── week3_api_scripts/            # multi-host version, see "Adding more hosts"
+│   ├── collect.sh
+│   ├── agent.py
+│   ├── approve.py
+│   └── run.sh
+└── week6_clamav_email/
+    ├── initial_scan_demo.py      # scan, claude reports, clamav, email
+    └── scheduled_scan.sh         # cron entry point
 ```
 
 ## Requirements
 
-- Ubuntu 26.04 LTS ([download](https://ubuntu.com/download/server)), 2 vCPU and 4 GB RAM recommended (ClamAV needs ~1.5 GB)
+- Ubuntu 26.04 LTS ([download](https://ubuntu.com/download/server)), 2 vCPU and 4 GB RAM recommended (ClamAV needs about 1.5 GB)
 - Python 3, MySQL Server, ClamAV
-- An Anthropic API key from the [Claude Console](https://console.anthropic.com)
-- A Gmail account with an app password (for email)
+- An Anthropic API key from the [Claude Console](https://console.anthropic.com), with credit loaded
+- A Gmail account with 2-Step Verification and an [app password](https://myaccount.google.com/apppasswords)
+- Outbound access to `smtp.gmail.com` on port 465
 
 ## Setup
 
@@ -57,9 +72,11 @@ ai-security-agent/
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y python3 python3-venv mysql-server git clamav unzip
+sudo apt install -y python3 python3-venv mysql-server git clamav
 sudo mysql_secure_installation
-sudo systemctl stop clamav-freshclam && sudo freshclam && sudo systemctl start clamav-freshclam
+sudo systemctl stop clamav-freshclam && sudo freshclam
+sudo systemctl enable --now clamav-freshclam mysql
+sudo timedatectl set-timezone America/New_York
 ```
 
 ### 2. Python environment
@@ -67,8 +84,7 @@ sudo systemctl stop clamav-freshclam && sudo freshclam && sudo systemctl start c
 ```bash
 cd ~/ai-security-agent
 python3 -m venv .venv
-source .venv/bin/activate
-pip install anthropic pymysql python-dotenv
+.venv/bin/pip install anthropic pymysql python-dotenv cryptography
 ```
 
 ### 3. Database
@@ -78,7 +94,7 @@ sudo mysql
 ```
 ```sql
 CREATE DATABASE ai_security_agent;
-CREATE USER 'agent_app'@'localhost' IDENTIFIED BY 'your-password';
+CREATE USER 'agent_app'@'localhost' IDENTIFIED BY 'your-strong-password';
 GRANT ALL PRIVILEGES ON ai_security_agent.* TO 'agent_app'@'localhost';
 FLUSH PRIVILEGES;
 EXIT;
@@ -88,36 +104,42 @@ mysql -u agent_app -p < week2_database/populate.sql
 mysql -u agent_app -p < week2_database/seed_data.sql
 ```
 
+Add recipients:
+```sql
+INSERT INTO security_analysts (staff_name, staff_role, staff_email) VALUES ('Name', 'Security Analyst', 'analyst@example.com');
+INSERT INTO managers_higher_ups (manager_name, manager_email, manager_department) VALUES ('Name', 'manager@example.com', 'Department');
+```
+
 ### 4. Environment file
 
-Create `~/ai-security-agent/.env`:
+Create `~/ai-security-agent/.env` with no quotes around values:
 ```
 ANTHROPIC_API_KEY=your-key
 DB_USER=agent_app
-DB_PASSWORD=your-password
+DB_PASSWORD=your-strong-password
 DB_NAME=ai_security_agent
-REVIEWER_EMAIL=your-email-in-security_analysts
-GMAIL_USER=
-GMAIL_APP_PASSWORD=
+REVIEWER_EMAIL=analyst@example.com
+GMAIL_USER=yourname@gmail.com
+GMAIL_APP_PASSWORD=16-letter-app-password
 ```
 Then lock it down:
 ```bash
 chmod 600 .env
 ```
 
-### 5. Folders
+### 5. Permissions
 
 ```bash
-mkdir -p incoming processed rejected reports
-chmod 700 incoming processed rejected reports
-chmod +x week3_api_scripts/*.sh
+chmod 750 ~/ai-security-agent
+chmod 750 week6_clamav_email/scheduled_scan.sh
+chmod 640 week6_clamav_email/initial_scan_demo.py
+sudo touch /var/log/ai-agent.log && sudo chmod 600 /var/log/ai-agent.log
 ```
 
 ### 6. Initial report
 
 ```bash
-sudo ~/ai-security-agent/week3_api_scripts/run.sh initial
-sudo tail -n 20 /var/log/ai-agent.log
+sudo .venv/bin/python week6_clamav_email/initial_scan_demo.py initial
 ```
 
 ### 7. Schedule
@@ -126,66 +148,59 @@ sudo tail -n 20 /var/log/ai-agent.log
 sudo crontab -e
 ```
 ```
-0 2 * * * /home/capstone/ai-security-agent/week3_api_scripts/run.sh nightly
-0 3 * * 0 /home/capstone/ai-security-agent/week3_api_scripts/run.sh weekly
+0 2 * * * /home/capstone/ai-security-agent/week6_clamav_email/scheduled_scan.sh nightly
+0 3 * * 0 /home/capstone/ai-security-agent/week6_clamav_email/scheduled_scan.sh weekly
 ```
 
-## Reviewing reports
-
+Check a scheduled run with:
 ```bash
-sudo ~/ai-security-agent/.venv/bin/python ~/ai-security-agent/week3_api_scripts/approve.py
+sudo tail -n 30 /var/log/ai-agent.log
 ```
-
-Each report moves through these statuses: `pending_review` → `approved` / `rejected` → `sent`.
-
-## Adding a host
-
-1. Add it to the database. The hostname must match what `hostname` prints on that machine:
-   ```sql
-   INSERT INTO endpoints (ip_address, hostname, os_version) VALUES ('192.168.x.x', 'hostname', 'Ubuntu 24.04');
-   ```
-2. On the new host, install the script and create a key:
-   ```bash
-   sudo mkdir -p /opt/ai-agent
-   sudo cp collect.sh /opt/ai-agent/ && sudo chmod 700 /opt/ai-agent/collect.sh
-   sudo apt install -y clamav
-   sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ""
-   ```
-3. Add the host's public key to `~/.ssh/authorized_keys` on the capstone VM, with `restrict ` in front of it so the key can only copy files.
-4. Run the initial scan on the host, then schedule it:
-   ```bash
-   sudo /opt/ai-agent/collect.sh initial
-   sudo crontab -e
-   ```
-   ```
-   30 1 * * * /opt/ai-agent/collect.sh nightly
-   0 1 * * 0 /opt/ai-agent/collect.sh weekly
-   ```
-5. Optional: to let `approve.py` install updates, create an `aiagent` user on the host with SSH key access. Its only sudo permission should be `/usr/bin/unattended-upgrade`.
 
 ## Security
 
-- The API key and database password live only in `.env` (`chmod 600`), which is excluded from git.
-- Usernames and MAC addresses are redacted before anything is sent to the API. IP redaction can be turned on with `redact_ips = True` in `agent.py`.
-- Raw scans and reports are root-only (`chmod 600`).
-- Only hosts in the `endpoints` table get reports. Anything else goes to `rejected/`.
-- Each run sends at most 60,000 characters per host to the API, to keep costs predictable.
-- Nothing changes on a host unless a reviewer approves it in `approve.py`.
+- The API key, database password, and Gmail app password live only in `.env` (`chmod 600`), which is excluded from git.
+- Usernames and MAC addresses are redacted before anything is sent to the API, and each run sends at most 60,000 characters.
+- Email is sent over TLS on port 465 with Gmail's certificate verified. Recipients are BCC'd so they can't see each other.
+- ClamAV details (file paths, detection names) go to security analysts only. A code-level filter strips them from the summary even if the AI includes them.
+- Reports, the log, and the `reports/` folder are root-only (`600` / `700`).
+- `scheduled_scan.sh` uses `umask 077` and a lock file, so new files are private and two scans never run at once.
+- The prompt tells the AI never to recommend deleting data, disabling security tools, or opening ports, to always allow SSH before enabling the firewall, and to ignore virtual BIOS dates.
+- Nothing is sent to managers until a human approves it.
 
 ## Testing
 
-To test whether ClamAV findings make it into the report, put the [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/) (a harmless file every antivirus flags as malware) in `/tmp` and run a weekly scan:
+**Email login** (sends nothing):
 ```bash
-sudo ~/ai-security-agent/week3_api_scripts/run.sh weekly
+.venv/bin/python - << 'EOF'
+import os, smtplib, ssl
+from dotenv import load_dotenv
+load_dotenv(".env")
+s = smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=15)
+s.login(os.getenv("GMAIL_USER"), os.getenv("GMAIL_APP_PASSWORD"))
+print("465 login ok")
+s.quit()
+EOF
 ```
-The report should flag it.
+
+**ClamAV detection:** put the [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/) (a harmless file every antivirus flags) in `/tmp` and run a weekly scan:
+```bash
+sudo .venv/bin/python week6_clamav_email/initial_scan_demo.py weekly
+```
+The technical report should list it, and the summary should only say the virus scan found a suspicious file.
+
+## Adding more hosts
+
+`week3_api_scripts/` holds the multi-host version: each host runs `collect.sh` and sends its results to this server, and `agent.py` and `approve.py` process them. It uses the `endpoints` table as an allow-list, so only listed hosts get reports.
 
 ## Troubleshooting
 
 | Problem | Check |
 |---------|-------|
 | No report created | `sudo tail /var/log/ai-agent.log` |
-| Host's scan lands in `rejected/` | Its hostname isn't in the `endpoints` table |
-| `send failed` on a host | SSH key isn't in the capstone VM's `authorized_keys` |
+| `No database selected` or `0 analyst(s)` | `DB_NAME` and other `DB_` values in `.env` |
+| `Can't connect to local MySQL server` | `sudo systemctl status mysql`, then `sudo systemctl start mysql` |
+| `Connection unexpectedly closed` on email | Outbound port 465 blocked by the router or firewall |
+| Email authentication error | App password must be 16 letters, no spaces, with 2-Step Verification on |
 | API error | API key in `.env`, and credit in the Claude Console |
-| Database error | `DB_` values in `.env`, and `sudo systemctl status mysql` |
+| ClamAV missing from the report | `clamscan --version`, then `sudo freshclam` |
